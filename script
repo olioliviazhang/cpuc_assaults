@@ -30,17 +30,13 @@ taxonomy as (
 -- This will be needed as we will need to check each bliss ticket associated with an incident to see if it has a responsive safety type (bliss type uuid)
 taxonomy_bliss as (
   select
-    b.*,
-    cpuc_classification,
-    cpuc_category,
-    cpuc_subcategory,
+    t.*,
     bliss_contact_type_uuid
   from
-    secure_safety.vtm_standard_latest b
-    join cpuc_classification c on b.category = c.category
-    and b.subcategory = c.subcategory
-    join secure_safety.vtm_bliss_latest bl on b.category = bl.standard_category
-    and b.subcategory = bl.standard_subcategory
+    taxonomy t
+    join secure_safety.vtm_bliss_latest bl on t.category = bl.standard_category
+    and t.subcategory = bl.standard_subcategory
+--OZ: improve query perfromance
 ),
 
 -- CTE - Base incident set to pull ALL rides incidents in CA and reported against is not 3rd party
@@ -102,7 +98,7 @@ flack_dominant_classification as (
       '21'
     )
     -- California only
-    and dominant_ticket_reported_against_provided_by_agent not in ('THIRD_PARTY','TAXI')
+    and dominant_ticket_reported_against_provided_by_agent not in ('THIRD_PARTY','TAXI') -- OZ: should we exclude Unknown and Eater as well since it's P2P rides only per request?
 ),
 
 -- CTE - Pull all bliss tickets that are related a Trip UUID found in base incident set 
@@ -194,7 +190,9 @@ bliss_ticket_investigation as (
         ) 
   and source = 'agent'
   and visibility = 'external'
-  and date(hm.datestr) > date '2021-08-30'
+  and date(hm.datestr) > date '{{begin_date_inclusive}}' - interval '1' day
+  --and date(hm.datestr) > date '2021-08-30'
+  --OZ: update it to dynamic parameter for easier future rerun 
   and (
     content like ('%more details%')
     or content like ('%additional details%')
@@ -296,7 +294,7 @@ driver_waitlist_rejections as (
     action_timestamp,
     action_timestamp AT TIME ZONE 'America/Los_Angeles' as action_time_local,
     requester_type as action_ticket_type,
-    fds.status,
+    fds.status, 
     row_number() over (
       partition by f.trip_uuid
       order by
@@ -308,7 +306,7 @@ driver_waitlist_rejections as (
     join customer_obsession.fact_bliss_action fba on f.bliss_ticket = fba.ticket_uuid
     join dwh.fact_driver_status fds on f.trip_driver_uuid = fds.driver_uuid
   where
-    fds.status IN ('Wait Listed', 'Rejected')
+    fds.status IN ('Wait Listed', 'Rejected') --OZ: should we include Waitlisted (Auto-Reactivation) and Waitlisted for Missing Docs?
     and --find suspension status change immediately post action_timestamp (added in 1 hour buffer)
     fds.begin_effective_timestamp >= action_timestamp - interval '1' hour
     and fds.begin_effective_timestamp < action_timestamp + interval '1' hour
@@ -446,14 +444,21 @@ from
       'PSG0038150' as TNCID,
       '20220919' as SubmissionDate,
       'NOT PROVIDED' as RideId,
-      upper(t.uuid) as Waybill1,
-      --waybill1 will be hashed trip_uuid
-      '' as Waybill2,
-      '' as Waybill3,
-      '' as Waybill4,
-      '' as Waybill5,
-      '' as Waybill6,
-      '' as Waybill7,
+      coalesce(test.waybill1,'') Waybill1,
+      coalesce(test.waybill2,'') Waybill2,
+      coalesce(test.waybill3,'') Waybill3,
+      coalesce(test.waybill4,'') Waybill4,
+      coalesce(test.waybill5,'') Waybill5,
+      coalesce(test.waybill6,'') Waybill6,
+      coalesce(test.waybill7,'') Waybill7,
+    --   upper(t.uuid) as Waybill1,
+    --   --waybill1 will be hashed trip_uuid
+    --   '' as Waybill2,
+    --   '' as Waybill3,
+    --   '' as Waybill4,
+    --   '' as Waybill5,
+    --   '' as Waybill6,
+    --   '' as Waybill7,
       upper(
         concat(
           substr(t.uuid, 1, 8),
@@ -473,31 +478,36 @@ from
         )
       ) as ComplaintID,
       -- d.lastname||', '||d.firstname as "Name of Driver (Last Name, First Name)", --removing as we will have a mapping csv for driver uuid to name
-      case
-        when t.driver_uuid IS NOT null
-        THEN upper(t.driver_uuid)
-        else ''
-      end as DriverID,
-      case
-        when v.vin IS NOT null
-        THEN upper(v.vin)
-        else ''
-      end as VIN,
-      case
-        when v.make IS NOT null
-        THEN upper(v.make)
-        else ''
-      end as VehicleMake,
-      case
-        when v.model IS NOT null
-        THEN upper(v.model)
-        else ''
-      end as VehicleModel,
-      case
-        when v.year IS NOT null
-        THEN cast(v.year as varchar)
-        else ''
-      end as VehicleYear,
+    --   case
+    --     when t.driver_uuid IS NOT null
+    --     THEN upper(t.driver_uuid)
+    --     else ''
+    --   end as DriverID,
+    --   case
+    --     when v.vin IS NOT null
+    --     THEN upper(v.vin)
+    --     else ''
+    --   end as VIN,
+    --   case
+    --     when v.make IS NOT null
+    --     THEN upper(v.make)
+    --     else ''
+    --   end as VehicleMake,
+    --   case
+    --     when v.model IS NOT null
+    --     THEN upper(v.model)
+    --     else ''
+    --   end as VehicleModel,
+    --   case
+    --     when v.year IS NOT null
+    --     THEN cast(v.year as varchar)
+    --     else ''
+    --   end as VehicleYear,
+      coalesce(upper(t.driver_uuid),'') as DriverID,
+      coalesce(upper(v.vin),'') as VIN,
+      coalesce(upper(v.make),'') as VehicleMake,
+      coalesce(upper(v.model),'') as VehicleModel,
+      coalesce(cast(v.year as varchar),'') as VehicleYear,
       date_format(
         coalesce(
           t.dropoff_timestamp_local,
@@ -798,7 +808,7 @@ from
         29,
         228,
         21
-      ) -- California only
+      ) -- California only *Why filter this again since it's already in where clause?
       join dwh.dim_driver d on d.driver_uuid = f.trip_driver_uuid
       join dwh.dim_vehicle v on v.vehicle_uuid = t.vehicle_uuid
       join dwh.fact_driver_flow fdf on d.driver_uuid = fdf.driver_uuid
@@ -814,10 +824,11 @@ from
       left join flack_responses fs on fs.trip_uuid = t.uuid  
       left join bliss_ticket_investigation bi on bi.trip_uuid = t.uuid
       left join rider_ban_tag rbt on rbt.trip_uuid = t.uuid
+      left join secure_compliance.cds_report_ca_request_accepted_june test on t.uuid=test.trip_uuid --OZ: getting waybill1-7 from cds
     where
       1 = 1
       and date(t.datestr) between date('{{begin_date_inclusive}}')
-      and date('{{end_date_exclusive}}')
+      and date('{{end_date_exclusive}}') 
       and date(t.request_timestamp_local) >= date('{{begin_date_inclusive}}')
       and date(t.request_timestamp_local) < date('{{end_date_exclusive}}')
       and t.city_id in (
