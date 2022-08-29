@@ -1,869 +1,862 @@
-{\rtf1\ansi\ansicpg1252\cocoartf2639
-\cocoatextscaling0\cocoaplatform0{\fonttbl\f0\fswiss\fcharset0 Helvetica;}
-{\colortbl;\red255\green255\blue255;}
-{\*\expandedcolortbl;;}
-\margl1440\margr1440\vieww11520\viewh8400\viewkind0
-\pard\tx720\tx1440\tx2160\tx2880\tx3600\tx4320\tx5040\tx5760\tx6480\tx7200\tx7920\tx8640\pardirnatural\partightenfactor0
+--P2P Rides in CA with reported "assaults" reported against the rider or driver between 9/1-8/31 annually.  
+--CPUC does not want us to rely on only final classification and ideally wants any reference to an assault on any ticket
 
-\f0\fs24 \cf0 --P2P Rides in CA with reported "assaults" reported against the rider or driver between 9/1-8/31 annually.  \
---CPUC does not want us to rely on only final classification and ideally wants any reference to an assault on any ticket\
-\
---CTE - Taxonomy Safety Types that were deemed responsive to CPUC's "assault" definition and attached examples\
-with cpuc_classification as (\
-  select\
-    category,\
-    coalesce(subcategory, '') as subcategory,\
-    category as cpuc_category,\
-    cpuc_subcategory,\
-    cpuc_classification\
-  from\
-    kirby_external_data.cpuc_taxonomy_mapping_2021\
-),\
-\
---CTE - joining above responsive list to latest taxonomy\
-taxonomy as (\
-  select\
-    b.*,\
-    cpuc_category,\
-    cpuc_classification,\
-    cpuc_subcategory\
-  from\
-    secure_safety.vtm_standard_latest b\
-    join cpuc_classification c on b.category = c.category\
-    and b.subcategory = c.subcategory\
-),\
-\
--- CTE - Pulling latest taxonomy and the related bliss type uuids.  \
--- This will be needed as we will need to check each bliss ticket associated with an incident to see if it has a responsive safety type (bliss type uuid)\
-taxonomy_bliss as (\
-  select\
-    b.*,\
-    cpuc_classification,\
-    cpuc_category,\
-    cpuc_subcategory,\
-    bliss_contact_type_uuid\
-  from\
-    secure_safety.vtm_standard_latest b\
-    join cpuc_classification c on b.category = c.category\
-    and b.subcategory = c.subcategory\
-    join secure_safety.vtm_bliss_latest bl on b.category = bl.standard_category\
-    and b.subcategory = bl.standard_subcategory\
-),\
-\
--- CTE - Base incident set to pull ALL rides incidents in CA and reported against is not 3rd party\
--- We will not yet filter for responsive types as we need to check the related bliss tickets to ensure no bliss ticket has a responsive type\
--- We will not be filtering for invalid tickets per requirements to be over inclusive and base on report\
-flack_dominant_classification as (\
-  select\
-    event_id,\
-    oti.trip_uuid,\
-    trip_driver_uuid,\
-    trip_client_uuid,\
-    trip_request_time,\
-    trip_request_time_local,\
-    first_reported_at,\
-    event_resolved_at,\
-    oti.category,\
-    oti.subcategory,\
-    trip_city_id,\
-    dominant_ticket_type,\
-    dominant_ticket_id,\
-    oti.reporter,\
-    case\
-      when dominant_ticket_type = 'JIRA'\
-      then concat(\
-        'https://jira.uberinternal.com/browse/',\
-        dominant_ticket_id\
-      )\
-      when dominant_ticket_type = 'BLISS'\
-      then concat(\
-        'https://bliss.uberinternal.com/contacts/',\
-        dominant_ticket_id\
-      )\
-    end as dominant_ticket_link,\
-    bliss_tickets_count,\
-    jira_tickets_count,\
-    dominant_ticket_reported_against_provided_by_agent,\
-    dominant_ticket_reported_against_inferred_possible,\
-    dominant_ticket_reported_against_inferred_probable,\
-    is_dominant_ticket_invalid\
-  from\
-    secure_safety.on_trip_incidents oti \
-  where\
-    date(trip_request_time_local) >= date('\{\{begin_date_inclusive\}\}')\
-    and date(trip_request_time_local) < date('\{\{end_date_exclusive\}\}')\
-    and trip_country_name = 'United States'\
-    and trip_city_id in (\
-      '41',\
-      '1',\
-      '229',\
-      '212',\
-      '220',\
-      '191',\
-      '181',\
-      '241',\
-      '12',\
-      '30',\
-      '29',\
-      '228',\
-      '21'\
-    )\
-    -- California only\
-    and dominant_ticket_reported_against_provided_by_agent not in ('THIRD_PARTY','TAXI')\
-),\
-\
--- CTE - Pull all bliss tickets that are related a Trip UUID found in base incident set \
-flack_bliss_any as (\
-  select distinct\
-    oti.trip_uuid,\
-    t.category as any_category,\
-    coalesce(t.subcategory, '') as any_subcategory,\
-    t.cpuc_subcategory as any_cpuc_subcategory,\
-    t.cpuc_classification as any_cpuc_classification\
-  from\
-    dwh.dim_bliss_ticket bt\
-    join flack_dominant_classification oti on bt.trip_uuid = oti.trip_uuid\
-    join taxonomy_bliss t on bt.type_uuid = t.bliss_contact_type_uuid\
-  where\
-    1 = 1\
-    and create_timestamp >= date '\{\{begin_date_inclusive\}\}' -- Sacramento, San Francisco, Modesto, Fresno, Bakersfield, San Luis Obispo, Santa Barbara, Ventura, Los Angeles, Orange County, Palm Springs, Inland Empire, San Diego\
-) ,\
-\
---CTE - from Base Incident Set, identify the incidents that have a responsive dominant ticket classification OR any responsive Bliss type\
-flack_base as (\
-  select\
-   fdc.*,t.cpuc_subcategory, t.cpuc_category, t.cpuc_classification,fba.any_category, fba.any_subcategory, fba.any_cpuc_subcategory, any_cpuc_classification\
-  from\
-    flack_dominant_classification fdc\
-    left join taxonomy t on fdc.category = t.category\
-    and fdc.subcategory = t.subcategory\
-    left join\
-    flack_bliss_any fba on fdc.trip_uuid = fba.trip_uuid\
-  where\
-  t.category is not null  \
-  or fba.any_category is not null\
-),\
-\
--- CTE - Additional details (such as related timestamps)  are needed for each responsive incident that can only be found within the Bliss tickets\
-flack_bliss as (\
-  select\
-    oti.trip_uuid,\
-    trip_driver_uuid,\
-    trip_client_uuid,\
-    bt.uuid as bliss_ticket,\
-    close_timestamp,\
-    requester_type,\
-    has_agent_view,\
-    first_solve_timestamp,\
-    requester_uuid,\
-    cpuc_subcategory as cpuc_sub1,\
-    any_subcategory as any_sub1\
-  from\
-    dwh.dim_bliss_ticket bt\
-    join flack_base oti on bt.trip_uuid = oti.trip_uuid\
-  where\
-    1 = 1\
-    and create_timestamp >= date '\{\{begin_date_inclusive\}\}' \
-),\
-\
--- CTE - For each incident we need to identify if the rider and driver tickets related to an incident have an agent message\
--- These details will be needed to \
-flack_responses as (\
-  select \
-    trip_uuid, \
-    max(rider_ticket) as rider_ticket, \
-    max(driver_ticket) as driver_ticket\
-  from (\
-    select \
-        trip_uuid, \
-        case when requester_uuid = trip_client_uuid and count_agent_messages > 0 then 1 else 0 end as rider_ticket,\
-        case when requester_uuid = trip_driver_uuid and count_agent_messages > 0 then 1 else 0 end as driver_ticket\
-    from flack_bliss bl \
-    left join customer_obsession.analytics_bliss_ticket abt on bl.bliss_ticket = abt.ticket_uuid\
-    ) a\
-group by 1\
-),\
-\
-bliss_ticket_investigation as (\
-  select \
-    trip_uuid, \
-    'Y' as investigation_bliss\
-  from \
-    flack_bliss ba \
-  join \
-    dwh.hbo_message hm on ba.bliss_ticket = hm.contact_id\
-  where \
-    coalesce(cpuc_sub1,any_sub1) \
-    in (\
-          'Insufficient Information',\
-          'Parent Category Usage Tracking',\
-          'Public Urination'\
-        ) \
-  and source = 'agent'\
-  and visibility = 'external'\
-  and date(hm.datestr) > date '2021-08-30'\
-  and (\
-    content like ('%more details%')\
-    or content like ('%additional details%')\
-    or content like ('%more information%')\
-    or content like ('%sharing specific%')\
-    or lower(content) like ('%please provide%')\
-    or content like ('%provid% us%')\
-    or lower(content) like ('%provide additional%')\
-    or content like ('%specific details%')\
-    )\
-),\
-\
-flack as (\
-  select\
-    flack_base.*,\
-    close_timestamp,\
-    requester_type,\
-    has_agent_view,\
-    first_solve_timestamp,\
-    bliss_ticket\
-  from\
-    flack_base \
-    left join flack_bliss b on flack_base.trip_uuid = b.trip_uuid\
-),\
-\
-end_trip_details as (\
-  --for non completed trips, calculate end trip time and location\
-  select\
-    *\
-  from\
-    (\
-      select\
-        job_uuid,\
-        end_timestamp_local as end_trip_local,\
-        end_lat,\
-        end_lng,\
-        row_number() over (\
-          partition by job_uuid\
-          order by\
-            end_timestamp_local desc\
-        ) as rnk\
-      from\
-        dwh.fact_job_state\
-      where\
-        processed_date >= '\{\{begin_date_inclusive\}\}'\
-        and city_id in (\
-          41,\
-          1,\
-          229,\
-          212,\
-          220,\
-          191,\
-          181,\
-          241,\
-          12,\
-          30,\
-          29,\
-          228,\
-          21\
-        )\
-    ) a\
-  where\
-    rnk = 1\
-),\
---deactivation table\
-deactivations as (\
-  select\
-    distinct user_uuid,\
-    jira_key,\
-    'Deactivated' as dconsequence\
-  from\
-    secure_safety.user_deactivation_reason_history\
-  where\
-    date(deactivated_at) >= date '\{\{begin_date_inclusive\}\}'\
-    and partner_city_id in (\
-      41,\
-      1,\
-      229,\
-      212,\
-      220,\
-      191,\
-      181,\
-      241,\
-      12,\
-      30,\
-      29,\
-      228,\
-      21\
-    )\
-),\
-driver_waitlist_rejections as (\
-  select\
-    f.trip_uuid,\
-    f.trip_driver_uuid,\
-    fba.ticket_uuid as bliss_ticket,\
-    value,\
-    fds.begin_effective_timestamp,\
-    fds.begin_effective_timestamp AT TIME ZONE 'America/Los_Angeles' as rejection_time_local,\
-    action_timestamp,\
-    action_timestamp AT TIME ZONE 'America/Los_Angeles' as action_time_local,\
-    requester_type as action_ticket_type,\
-    fds.status,\
-    row_number() over (\
-      partition by f.trip_uuid\
-      order by\
-        action_timestamp desc\
-    ) as row_num\
-    --identify the row with the last waitlist or rejection with row_num 1\
-  from\
-    flack f\
-    join customer_obsession.fact_bliss_action fba on f.bliss_ticket = fba.ticket_uuid\
-    join dwh.fact_driver_status fds on f.trip_driver_uuid = fds.driver_uuid\
-  where\
-    fds.status IN ('Wait Listed', 'Rejected')\
-    and --find suspension status change immediately post action_timestamp (added in 1 hour buffer)\
-    fds.begin_effective_timestamp >= action_timestamp - interval '1' hour\
-    and fds.begin_effective_timestamp < action_timestamp + interval '1' hour\
-    and type in (\
-      'changeDriverStatusV1',\
-      'updateStatusLocksWithTranslationParamsV1'\
-    )\
-    and value in (\
-      'LockSafetyPermanent:true',\
-      'LockSafety:true',\
-      'WAITLISTED',\
-      'REJECTED'\
-    )\
-    and date(fba.datestr) >= date '\{\{begin_date_inclusive\}\}'\
-),\
-first_driver_suspension as -- looking at the first timestamp the action took place as a waitlist could happen before a rejection \
- (\
-  select\
-    trip_uuid, trip_driver_uuid,\
-    min(action_time_local) as action_time_local\
-  from\
-    driver_waitlist_rejections\
-  group by\
-    1,2\
-),\
-first_driver_reactivation as \
-(\
-  select\
-    trip_driver_uuid,\
-    min(fds.begin_effective_timestamp) AT TIME ZONE 'America/Los_Angeles' as reactive_time_local\
-  from\
-    driver_waitlist_rejections wr \
-    join dwh.fact_driver_status fds on wr.trip_driver_uuid = fds.driver_uuid\
-    where fds.begin_effective_timestamp > wr.begin_effective_timestamp\
-    and fds.status = 'Active'\
-  group by\
-    1\
-\
-),\
-\
-rider_ban_tag as (\
-  select \
-    trip_uuid,\
-    user_uuid, \
-    created_at, \
-    deleted_at    \
-  from \
-    raw_etl_data.api_user_tags tag \
-  join \
-    flack_dominant_classification flack_tag on tag.user_uuid = flack_tag.trip_client_uuid\
-    and created_at between from_iso8601_timestamp(first_reported_at) and event_resolved_at\
-  where \
-    name = 'ban' \
-),\
-rider_suspensions as (\
-  select\
-    trip_uuid,\
-    type,\
-    min(action_timestamp) as action_timestamp\
-  from\
-    flack f\
-    join customer_obsession.fact_bliss_action fba on f.bliss_ticket = fba.ticket_uuid\
-  where\
-    type in ('banClientV1')\
-    and date(fba.datestr) >= date '\{\{begin_date_inclusive\}\}'\
-    group by 1,2\
-),\
-\
-rider_reactivation as (\
-  select\
-    trip_uuid,\
-    type,\
-    min(action_timestamp) as unban_action_timestamp\
-  from\
-    flack f\
-    join customer_obsession.fact_bliss_action fba on f.bliss_ticket = fba.ticket_uuid\
-  where\
-    type in ('unbanClientV1')\
-    and date(fba.datestr) >= date '\{\{begin_date_inclusive\}\}'\
-    group by 1,2\
-)\
-\
-select\
-  *\
-from\
-  (\
-    select\
-      distinct \
-      f.dominant_ticket_type,\
-      f.dominant_ticket_id,\
-      f.dominant_ticket_link as ticket_link,\
-    --   f.bliss_ticket,\
-      fdf.flow_type,\
-      t.flow,\
-      t.global_product_name,\
-      dominant_ticket_reported_against_provided_by_agent,\
-      j.action_on_reported_account,\
-      j.reporter,\
-      c.trip_uuid as compliance_match,\
-      t.uuid as trip_uuid,\
-      f.category,\
-      f.subcategory,\
-      cpuc_category,\
-      cpuc_subcategory, \
-      cpuc_classification,\
-      any_category, \
-      any_subcategory, \
-      any_cpuc_subcategory,\
-      dominant_ticket_reported_against_inferred_possible,\
-      dominant_ticket_reported_against_inferred_probable,\
-      reactive_time_local,\
-      dwr.row_num,\
-      dwr.status,\
-      dwr.action_timestamp,\
-      rider_ticket,\
-      driver_ticket,\
-      is_dominant_ticket_invalid,\
-      investigation_bliss,\
-      rbt.created_at,\
-      rbt.deleted_at,\
-      event_resolved_at,\
-      first_reported_at,\
-    case\
-        when cpuc_classification is not null\
-        then 1\
-        -- upper(coalesce(cpuc_classification,any_cpuc_classification))\
-        else 0\
-        -- upper(concat(coalesce(cpuc_category,any_category), ' - ', coalesce(cpuc_subcategory,any_cpuc_subcategory)))\
-      end as AssaultHarassType_test,\
-       coalesce(cpuc_classification,any_cpuc_classification),\
-       coalesce(cpuc_category,any_category), ' - ', coalesce(cpuc_subcategory,any_cpuc_subcategory),\
-      --all data above for information and QA purposes only\
-      --all data below will actually be sent to CPUC\
-      -- hash_tripid as "Waybill Number of Trip",\
-      'PSG0038150' as TNCID,\
-      '20220919' as SubmissionDate,\
-      'NOT PROVIDED' as RideId,\
-      upper(t.uuid) as Waybill1,\
-      --waybill1 will be hashed trip_uuid\
-      '' as Waybill2,\
-      '' as Waybill3,\
-      '' as Waybill4,\
-      '' as Waybill5,\
-      '' as Waybill6,\
-      '' as Waybill7,\
-      upper(\
-        concat(\
-          substr(t.uuid, 1, 8),\
-          '-',\
-          substr(t.driver_uuid, 1, 8),\
-          substr(\
-            cast(\
-              DATEDIFF(\
-                'day',\
-                date(request_date_id_local),\
-                date '1990-01-01'\
-              ) as varchar\
-            ),\
-            2,\
-            4\
-          )\
-        )\
-      ) as ComplaintID,\
-      -- d.lastname||', '||d.firstname as "Name of Driver (Last Name, First Name)", --removing as we will have a mapping csv for driver uuid to name\
-      case\
-        when t.driver_uuid IS NOT null\
-        THEN upper(t.driver_uuid)\
-        else ''\
-      end as DriverID,\
-      case\
-        when v.vin IS NOT null\
-        THEN upper(v.vin)\
-        else ''\
-      end as VIN,\
-      case\
-        when v.make IS NOT null\
-        THEN upper(v.make)\
-        else ''\
-      end as VehicleMake,\
-      case\
-        when v.model IS NOT null\
-        THEN upper(v.model)\
-        else ''\
-      end as VehicleModel,\
-      case\
-        when v.year IS NOT null\
-        THEN cast(v.year as varchar)\
-        else ''\
-      end as VehicleYear,\
-      date_format(\
-        coalesce(\
-          t.dropoff_timestamp_local,\
-          end_trip_local,\
-          t.request_timestamp_local\
-        ),\
-        '%Y%m%d %H:%i:%s'\
-      ) as AssaultHarassDate,\
-      substr(\
-        cast(\
-          coalesce(t.dropoff_lat, end_lat, t.request_lat) as varchar\
-        ),\
-        1,\
-        9\
-      ) as AssaultHarassLat,\
-      -- requested assault location but we can not determine exact location, defaulting to end trip\
-      substr(\
-        cast(\
-          coalesce(t.dropoff_lng, end_lng, t.request_lng) as varchar\
-        ),\
-        1,\
-        11\
-      ) as AssaultHarassLong,\
-      -- requested assault location but we can not determine exact location, defaulting to end trip\
-      coalesce(\
-        postalcode,\
-        zcta_where_ride_ended,\
-        zcta_where_ride_began\
-      ) as AssaultHarassZip,\
-      coalesce(\
-        concat(\
-          lpad(cast(statefp10 as varchar), 2, '0'),\
-          lpad(cast(countyfp10 as varchar), 3, '0'),\
-          lpad(cast(tractce10 as varchar), 6, '0')\
-        ),\
-        ''\
-      ) as AssaultHarassTract,\
-      case\
-        when census_block_code IS NOT null\
-        THEN concat(\
-          lpad(cast(statefp10 as varchar), 2, '0'),\
-          lpad(cast(countyfp10 as varchar), 3, '0'),\
-          lpad(cast(tractce10 as varchar), 6, '0'),\
-          lpad(cast(blockce as varchar), 4, '0')\
-        )\
-        else ''\
-      end as AssaultHarassCB,\
-      date_format(\
-        cast(\
-          concat(\
-            substr(first_reported_at, 1, 10),\
-            ' ',\
-            substr(first_reported_at, 12, 8),\
-            ' UTC'\
-          ) as timestamp with time zone\
-        ) AT TIME ZONE 'America/Los_Angeles',\
-        '%Y%m%d %H:%i:%s'\
-      ) as ComplaintFiledDate,\
-      case\
-        when coalesce(cpuc_subcategory,any_subcategory) in (\
-          'Insufficient Information',\
-          'Parent Category Usage Tracking',\
-          'Public Urination'\
-        ) and rider_ticket = 1 and driver_ticket = 1\
-        then 'Y'\
-        when coalesce(cpuc_subcategory,any_subcategory) in (\
-          'Insufficient Information',\
-          'Parent Category Usage Tracking',\
-          'Public Urination'\
-        ) then coalesce(investigation_bliss,'N')\
-        else 'Y'\
-      end as Investigation,\
-      case\
-        when fds.action_time_local is not null\
-        THEN date_format(fds.action_time_local, '%Y%m%d %H:%i:%s')\
-        else ''\
-      end as DriverSuspendDate,\
-      case\
-        when rs.type = 'banClientV1'\
-        then date_format(rs.action_timestamp at time zone 'America/Los_Angeles', '%Y%m%d %H:%i:%s')\
-        else coalesce(date_format(rbt.created_at at time zone 'America/Los_Angeles', '%Y%m%d %H:%i:%s'),'')\
-      end as PassengerSuspendDate,\
-      coalesce(\
-        date_format(\
-          event_resolved_at AT TIME ZONE 'America/Los_Angeles',\
-          '%Y%m%d %H:%i:%s'\
-        ),\
-        date_format(\
-          case\
-            when length(resolved_at) > 6\
-            then from_iso8601_timestamp(j.resolved_at) AT TIME ZONE 'America/Los_Angeles'\
-            else null\
-          end,\
-          '%Y%m%d %H:%i:%s'\
-        ),\
-        date_format(\
-          close_timestamp AT TIME ZONE 'America/Los_Angeles',\
-          '%Y%m%d %H:%i:%s'\
-        )\
-      ) as ComplaintResolveDate,\
-      case\
-        when cpuc_classification is not null\
-        then upper(coalesce(cpuc_classification,any_cpuc_classification))\
-        else upper(concat(coalesce(cpuc_category,any_category), ' - ', coalesce(cpuc_subcategory,any_cpuc_subcategory)))\
-      end as AssaultHarassType,\
-      case\
-        when \
-            cpuc_classification is not null  \
-            and cpuc_subcategory is not null\
-        then concat(\
-          'ON ',\
-          date_format(\
-            cast(\
-              concat(\
-                substr(first_reported_at, 1, 10),\
-                ' ',\
-                substr(first_reported_at, 12, 8),\
-                ' UTC'\
-              ) as timestamp with time zone\
-            ) AT TIME ZONE 'America/Los_Angeles',\
-            '%Y-%m-%d'\
-          ),\
-          ' AN INDIVIDUAL REPORTED A ',\
-          upper(cpuc_category),\
-          ' REGARDING ',\
-          upper(cpuc_subcategory),\
-          '.'\
-        )\
-        when \
-            cpuc_classification is null  \
-            and any_cpuc_subcategory is not null\
-        then concat(\
-          'ON ',\
-          date_format(\
-            cast(\
-              concat(\
-                substr(first_reported_at, 1, 10),\
-                ' ',\
-                substr(first_reported_at, 12, 8),\
-                ' UTC'\
-              ) as timestamp with time zone\
-            ) AT TIME ZONE 'America/Los_Angeles',\
-            '%Y-%m-%d'\
-          ),\
-          ' AN INDIVIDUAL REPORTED A ',\
-          upper(any_category),\
-          ' REGARDING ',\
-          upper(any_cpuc_subcategory),\
-          '.'\
-        )\
-        when \
-            cpuc_classification is not null  \
-            and cpuc_subcategory is null \
-        then concat(\
-          'ON ',\
-          date_format(\
-            cast(\
-              concat(\
-                substr(first_reported_at, 1, 10),\
-                ' ',\
-                substr(first_reported_at, 12, 8),\
-                ' UTC'\
-              ) as timestamp with time zone\
-            ) AT TIME ZONE 'America/Los_Angeles',\
-            '%Y-%m-%d'\
-          ),\
-          ' AN INDIVIDUAL REPORTED A ',\
-          upper(cpuc_category),\
-          '.')\
-          else\
-          concat(\
-          'ON ',\
-          date_format(\
-            cast(\
-              concat(\
-                substr(first_reported_at, 1, 10),\
-                ' ',\
-                substr(first_reported_at, 12, 8),\
-                ' UTC'\
-              ) as timestamp with time zone\
-            ) AT TIME ZONE 'America/Los_Angeles',\
-            '%Y-%m-%d'\
-          ),\
-          ' AN INDIVIDUAL REPORTED A ',\
-          upper(any_category),\
-          '.')\
-          end  \
-          as AssaultHarassDescr,\
-      '' as AssaultHarassDef,\
-      case\
-        when t.global_product_name = 'RIDESHARE'\
-        then 'Y'\
-        else 'N'\
-      end as PoolTrip,\
-      case\
-        when d.user_uuid = f.trip_driver_uuid \
-        then 'DEACTIVATED'\
-        when dwr.status = 'Rejected'\
-        then 'DEACTIVATED'\
-        when dwr.status = 'Wait Listed'\
-        and reactive_time_local is not null\
-        then 'REACTIVATED' --do we need to account for if it's still the last status change?\
-        --per Niki in meeting Leave it blank if in progress or waitlisted\
-        when dwr.status is null\
-        then 'CONTINUE'\
-        when dwr.status = 'Wait Listed'\
-        and reactive_time_local is null\
-        then ''\
-        else 'investigate'\
-      end as DriverConsequence,\
-      case\
-        when (\
-          incident_reported_against = 'Rider'\
-          and action_on_reported_account = 'Driver Deactivated or Rider Banned'\
-          ) then 'DEACTIVATED'\
-          when rr.unban_action_timestamp is not null\
-          then  'REACTIVATED'\
-          when rs.type is null then 'CONTINUE'\
-          else 'investigate'\
-        end\
-       as PassengerConsequence,\
- \
-      case        \
-        when \
-            coalesce(cpuc_subcategory,any_subcategory) in (\
-              'Insufficient Information',\
-              'Parent Category Usage Tracking',\
-              'Public Urination'\
-            ) \
-            and rider_ticket = 1 and driver_ticket = 1\
-            and (\
-            dominant_ticket_reported_against_provided_by_agent = 'DRIVER'\
-            or (dominant_ticket_reported_against_provided_by_agent = 'UNKNOWN' and dominant_ticket_reported_against_inferred_probable in ('DRIVER') )\
-            )\
-        then 'OUTBOUND MESSAGE SENT TO DRIVER.'\
-        when \
-            coalesce(cpuc_subcategory,any_subcategory) in (\
-              'Insufficient Information',\
-              'Parent Category Usage Tracking',\
-              'Public Urination'\
-            ) and rider_ticket = 1 and driver_ticket = 1\
-            and (\
-            dominant_ticket_reported_against_provided_by_agent = 'RIDER'\
-            or (dominant_ticket_reported_against_provided_by_agent = 'UNKNOWN' and dominant_ticket_reported_against_inferred_probable in ('RIDER') )\
-            )\
-        then 'OUTBOUND MESSAGE SENT TO RIDER.'  \
-        when \
-            coalesce(cpuc_subcategory,any_subcategory) in (\
-              'Insufficient Information',\
-              'Parent Category Usage Tracking',\
-              'Public Urination'\
-            ) and investigation_bliss is not null \
-        then 'OUTBOUND MESSAGE SENT TO REPORTER REQUESTING ADDITIONAL DETAILS.'\
-        when \
-            coalesce(cpuc_subcategory,any_subcategory) in (\
-              'Insufficient Information',\
-              'Parent Category Usage Tracking',\
-              'Public Urination'\
-            ) \
-        then 'investigate'\
-        when dominant_ticket_reported_against_provided_by_agent = 'DRIVER' then 'OUTBOUND MESSAGE SENT TO DRIVER.'\
-        when dominant_ticket_reported_against_provided_by_agent = 'UNKNOWN' and dominant_ticket_reported_against_inferred_probable in ('DRIVER') then 'OUTBOUND MESSAGE SENT TO DRIVER.'\
-        when dominant_ticket_reported_against_provided_by_agent = 'RIDER' then 'OUTBOUND MESSAGE SENT TO RIDER.'\
-        when dominant_ticket_reported_against_provided_by_agent = 'UNKNOWN' and dominant_ticket_reported_against_inferred_probable in ('RIDER') then 'OUTBOUND MESSAGE SENT TO RIDER.'\
-      end as ComplaintResolveDescr,\
-      case\
-        when c.banned = TRUE\
-        then 'N'\
-        else 'Y'\
-      end as PassengerCurrentAuth,\
-      case\
-        when d.status = 'Active'\
-        then 'Y'\
-        else 'N'\
-      end as DriverCurrentAuth,\
-      row_number() over (\
-        PARTITION by t.uuid\
-        order by\
-          postalcode asc, close_timestamp desc\
-      ) as dedupe\
-    from\
-      dwh.fact_trip t\
-      join flack f on t.uuid = f.trip_uuid\
-      left join dwh.dim_client c on f.trip_client_uuid = c.user_uuid\
-      left join driver_waitlist_rejections dwr on dwr.trip_uuid = f.trip_uuid and dwr.row_num = 1\
-      left join deactivations d on f.dominant_ticket_id = d.jira_key\
-      and t.city_id in (\
-        41,\
-        1,\
-        229,\
-        212,\
-        220,\
-        191,\
-        181,\
-        241,\
-        12,\
-        30,\
-        29,\
-        228,\
-        21\
-      ) -- California only\
-      join dwh.dim_driver d on d.driver_uuid = f.trip_driver_uuid\
-      join dwh.dim_vehicle v on v.vehicle_uuid = t.vehicle_uuid\
-      join dwh.fact_driver_flow fdf on d.driver_uuid = fdf.driver_uuid\
-      left join secure_safety.blackbird_jira_tickets j on j.ticket_id = f.dominant_ticket_id\
-      left join secure_compliance.cds_ca_trips c on t.uuid = c.trip_uuid --checking if trips exist in Compliance base table for trips reports\
-      left join secure_safety.tg_cpuc_zip z on st_intersects(z.simplified_shape_wkt, t.dropoff_point) --zipcode CA geo based on map_creation.geofences_mbi_postal\
-      left join secure_compliance.cds_geo_us_census_block on st_intersects(shape_wkt, t.dropoff_point) -- we are getting census block info from this table\
-      left join end_trip_details etd on f.trip_uuid = etd.job_uuid --join in trip details for non completed trips\
-      left join rider_suspensions rs on rs.trip_uuid = t.uuid\
-      left join rider_reactivation rr on rs.trip_uuid = t.uuid\
-      left join first_driver_suspension fds on fds.trip_uuid = t.uuid\
-      left join first_driver_reactivation fdr on fds.trip_driver_uuid = fdr.trip_driver_uuid\
-      left join flack_responses fs on fs.trip_uuid = t.uuid  \
-      left join bliss_ticket_investigation bi on bi.trip_uuid = t.uuid\
-      left join rider_ban_tag rbt on rbt.trip_uuid = t.uuid\
-    where\
-      1 = 1\
-      and date(t.datestr) between date('\{\{begin_date_inclusive\}\}')\
-      and date('\{\{end_date_exclusive\}\}')\
-      and date(t.request_timestamp_local) >= date('\{\{begin_date_inclusive\}\}')\
-      and date(t.request_timestamp_local) < date('\{\{end_date_exclusive\}\}')\
-      and t.city_id in (\
-        41,\
-        1,\
-        229,\
-        212,\
-        220,\
-        191,\
-        181,\
-        241,\
-        12,\
-        30,\
-        29,\
-        228,\
-        21)\
---we want to filter out reports based on third party\
-      and (\
-        start_timestamp <= t.request_timestamp_utc\
-        and (\
-          end_timestamp > t.request_timestamp_utc\
-          or end_timestamp is null\
-        )\
-      ) --to filter out driver flow at time of trip request\
-      and fdf.flow_type = 'P2P' --P2P only\
-      and (\
-        upper(t.global_product_name) in (\
-          'UBERX',\
-          'UBERXL',\
-          'RIDESHARE',\
-          'MID-TIER',\
-          'HOURLY',\
-          'SELECT',\
-          'GREEN'\
-        )\
-      ) --rides only\
-)\
-where\
-  1 = 1\
-  and dedupe = 1\
-order by\
- AssaultHarassDate}
+--CTE - Taxonomy Safety Types that were deemed responsive to CPUC's "assault" definition and attached examples
+with cpuc_classification as (
+  select
+    category,
+    coalesce(subcategory, '') as subcategory,
+    category as cpuc_category,
+    cpuc_subcategory,
+    cpuc_classification
+  from
+    kirby_external_data.cpuc_taxonomy_mapping_2021
+),
+
+--CTE - joining above responsive list to latest taxonomy
+taxonomy as (
+  select
+    b.*,
+    cpuc_category,
+    cpuc_classification,
+    cpuc_subcategory
+  from
+    secure_safety.vtm_standard_latest b
+    join cpuc_classification c on b.category = c.category
+    and b.subcategory = c.subcategory
+),
+
+-- CTE - Pulling latest taxonomy and the related bliss type uuids.  
+-- This will be needed as we will need to check each bliss ticket associated with an incident to see if it has a responsive safety type (bliss type uuid)
+taxonomy_bliss as (
+  select
+    b.*,
+    cpuc_classification,
+    cpuc_category,
+    cpuc_subcategory,
+    bliss_contact_type_uuid
+  from
+    secure_safety.vtm_standard_latest b
+    join cpuc_classification c on b.category = c.category
+    and b.subcategory = c.subcategory
+    join secure_safety.vtm_bliss_latest bl on b.category = bl.standard_category
+    and b.subcategory = bl.standard_subcategory
+),
+
+-- CTE - Base incident set to pull ALL rides incidents in CA and reported against is not 3rd party
+-- We will not yet filter for responsive types as we need to check the related bliss tickets to ensure no bliss ticket has a responsive type
+-- We will not be filtering for invalid tickets per requirements to be over inclusive and base on report
+flack_dominant_classification as (
+  select
+    event_id,
+    oti.trip_uuid,
+    trip_driver_uuid,
+    trip_client_uuid,
+    trip_request_time,
+    trip_request_time_local,
+    first_reported_at,
+    event_resolved_at,
+    oti.category,
+    oti.subcategory,
+    trip_city_id,
+    dominant_ticket_type,
+    dominant_ticket_id,
+    oti.reporter,
+    case
+      when dominant_ticket_type = 'JIRA'
+      then concat(
+        'https://jira.uberinternal.com/browse/',
+        dominant_ticket_id
+      )
+      when dominant_ticket_type = 'BLISS'
+      then concat(
+        'https://bliss.uberinternal.com/contacts/',
+        dominant_ticket_id
+      )
+    end as dominant_ticket_link,
+    bliss_tickets_count,
+    jira_tickets_count,
+    dominant_ticket_reported_against_provided_by_agent,
+    dominant_ticket_reported_against_inferred_possible,
+    dominant_ticket_reported_against_inferred_probable,
+    is_dominant_ticket_invalid
+  from
+    secure_safety.on_trip_incidents oti 
+  where
+    date(trip_request_time_local) >= date('{{begin_date_inclusive}}')
+    and date(trip_request_time_local) < date('{{end_date_exclusive}}')
+    and trip_country_name = 'United States'
+    and trip_city_id in (
+      '41',
+      '1',
+      '229',
+      '212',
+      '220',
+      '191',
+      '181',
+      '241',
+      '12',
+      '30',
+      '29',
+      '228',
+      '21'
+    )
+    -- California only
+    and dominant_ticket_reported_against_provided_by_agent not in ('THIRD_PARTY','TAXI')
+),
+
+-- CTE - Pull all bliss tickets that are related a Trip UUID found in base incident set 
+flack_bliss_any as (
+  select distinct
+    oti.trip_uuid,
+    t.category as any_category,
+    coalesce(t.subcategory, '') as any_subcategory,
+    t.cpuc_subcategory as any_cpuc_subcategory,
+    t.cpuc_classification as any_cpuc_classification
+  from
+    dwh.dim_bliss_ticket bt
+    join flack_dominant_classification oti on bt.trip_uuid = oti.trip_uuid
+    join taxonomy_bliss t on bt.type_uuid = t.bliss_contact_type_uuid
+  where
+    1 = 1
+    and create_timestamp >= date '{{begin_date_inclusive}}' -- Sacramento, San Francisco, Modesto, Fresno, Bakersfield, San Luis Obispo, Santa Barbara, Ventura, Los Angeles, Orange County, Palm Springs, Inland Empire, San Diego
+) ,
+
+--CTE - from Base Incident Set, identify the incidents that have a responsive dominant ticket classification OR any responsive Bliss type
+flack_base as (
+  select
+   fdc.*,t.cpuc_subcategory, t.cpuc_category, t.cpuc_classification,fba.any_category, fba.any_subcategory, fba.any_cpuc_subcategory, any_cpuc_classification
+  from
+    flack_dominant_classification fdc
+    left join taxonomy t on fdc.category = t.category
+    and fdc.subcategory = t.subcategory
+    left join
+    flack_bliss_any fba on fdc.trip_uuid = fba.trip_uuid
+  where
+  t.category is not null  
+  or fba.any_category is not null
+),
+
+-- CTE - Additional details (such as related timestamps)  are needed for each responsive incident that can only be found within the Bliss tickets
+flack_bliss as (
+  select
+    oti.trip_uuid,
+    trip_driver_uuid,
+    trip_client_uuid,
+    bt.uuid as bliss_ticket,
+    close_timestamp,
+    requester_type,
+    has_agent_view,
+    first_solve_timestamp,
+    requester_uuid,
+    cpuc_subcategory as cpuc_sub1,
+    any_subcategory as any_sub1
+  from
+    dwh.dim_bliss_ticket bt
+    join flack_base oti on bt.trip_uuid = oti.trip_uuid
+  where
+    1 = 1
+    and create_timestamp >= date '{{begin_date_inclusive}}' 
+),
+
+-- CTE - For each incident we need to identify if the rider and driver tickets related to an incident have an agent message
+-- These details will be needed to 
+flack_responses as (
+  select 
+    trip_uuid, 
+    max(rider_ticket) as rider_ticket, 
+    max(driver_ticket) as driver_ticket
+  from (
+    select 
+        trip_uuid, 
+        case when requester_uuid = trip_client_uuid and count_agent_messages > 0 then 1 else 0 end as rider_ticket,
+        case when requester_uuid = trip_driver_uuid and count_agent_messages > 0 then 1 else 0 end as driver_ticket
+    from flack_bliss bl 
+    left join customer_obsession.analytics_bliss_ticket abt on bl.bliss_ticket = abt.ticket_uuid
+    ) a
+group by 1
+),
+
+bliss_ticket_investigation as (
+  select 
+    trip_uuid, 
+    'Y' as investigation_bliss
+  from 
+    flack_bliss ba 
+  join 
+    dwh.hbo_message hm on ba.bliss_ticket = hm.contact_id
+  where 
+    coalesce(cpuc_sub1,any_sub1) 
+    in (
+          'Insufficient Information',
+          'Parent Category Usage Tracking',
+          'Public Urination'
+        ) 
+  and source = 'agent'
+  and visibility = 'external'
+  and date(hm.datestr) > date '2021-08-30'
+  and (
+    content like ('%more details%')
+    or content like ('%additional details%')
+    or content like ('%more information%')
+    or content like ('%sharing specific%')
+    or lower(content) like ('%please provide%')
+    or content like ('%provid% us%')
+    or lower(content) like ('%provide additional%')
+    or content like ('%specific details%')
+    )
+),
+
+flack as (
+  select
+    flack_base.*,
+    close_timestamp,
+    requester_type,
+    has_agent_view,
+    first_solve_timestamp,
+    bliss_ticket
+  from
+    flack_base 
+    left join flack_bliss b on flack_base.trip_uuid = b.trip_uuid
+),
+
+end_trip_details as (
+  --for non completed trips, calculate end trip time and location
+  select
+    *
+  from
+    (
+      select
+        job_uuid,
+        end_timestamp_local as end_trip_local,
+        end_lat,
+        end_lng,
+        row_number() over (
+          partition by job_uuid
+          order by
+            end_timestamp_local desc
+        ) as rnk
+      from
+        dwh.fact_job_state
+      where
+        processed_date >= '{{begin_date_inclusive}}'
+        and city_id in (
+          41,
+          1,
+          229,
+          212,
+          220,
+          191,
+          181,
+          241,
+          12,
+          30,
+          29,
+          228,
+          21
+        )
+    ) a
+  where
+    rnk = 1
+),
+--deactivation table
+deactivations as (
+  select
+    distinct user_uuid,
+    jira_key,
+    'Deactivated' as dconsequence
+  from
+    secure_safety.user_deactivation_reason_history
+  where
+    date(deactivated_at) >= date '{{begin_date_inclusive}}'
+    and partner_city_id in (
+      41,
+      1,
+      229,
+      212,
+      220,
+      191,
+      181,
+      241,
+      12,
+      30,
+      29,
+      228,
+      21
+    )
+),
+driver_waitlist_rejections as (
+  select
+    f.trip_uuid,
+    f.trip_driver_uuid,
+    fba.ticket_uuid as bliss_ticket,
+    value,
+    fds.begin_effective_timestamp,
+    fds.begin_effective_timestamp AT TIME ZONE 'America/Los_Angeles' as rejection_time_local,
+    action_timestamp,
+    action_timestamp AT TIME ZONE 'America/Los_Angeles' as action_time_local,
+    requester_type as action_ticket_type,
+    fds.status,
+    row_number() over (
+      partition by f.trip_uuid
+      order by
+        action_timestamp desc
+    ) as row_num
+    --identify the row with the last waitlist or rejection with row_num 1
+  from
+    flack f
+    join customer_obsession.fact_bliss_action fba on f.bliss_ticket = fba.ticket_uuid
+    join dwh.fact_driver_status fds on f.trip_driver_uuid = fds.driver_uuid
+  where
+    fds.status IN ('Wait Listed', 'Rejected')
+    and --find suspension status change immediately post action_timestamp (added in 1 hour buffer)
+    fds.begin_effective_timestamp >= action_timestamp - interval '1' hour
+    and fds.begin_effective_timestamp < action_timestamp + interval '1' hour
+    and type in (
+      'changeDriverStatusV1',
+      'updateStatusLocksWithTranslationParamsV1'
+    )
+    and value in (
+      'LockSafetyPermanent:true',
+      'LockSafety:true',
+      'WAITLISTED',
+      'REJECTED'
+    )
+    and date(fba.datestr) >= date '{{begin_date_inclusive}}'
+),
+first_driver_suspension as -- looking at the first timestamp the action took place as a waitlist could happen before a rejection 
+ (
+  select
+    trip_uuid, trip_driver_uuid,
+    min(action_time_local) as action_time_local
+  from
+    driver_waitlist_rejections
+  group by
+    1,2
+),
+first_driver_reactivation as 
+(
+  select
+    trip_driver_uuid,
+    min(fds.begin_effective_timestamp) AT TIME ZONE 'America/Los_Angeles' as reactive_time_local
+  from
+    driver_waitlist_rejections wr 
+    join dwh.fact_driver_status fds on wr.trip_driver_uuid = fds.driver_uuid
+    where fds.begin_effective_timestamp > wr.begin_effective_timestamp
+    and fds.status = 'Active'
+  group by
+    1
+
+),
+
+rider_ban_tag as (
+  select 
+    trip_uuid,
+    user_uuid, 
+    created_at, 
+    deleted_at    
+  from 
+    raw_etl_data.api_user_tags tag 
+  join 
+    flack_dominant_classification flack_tag on tag.user_uuid = flack_tag.trip_client_uuid
+    and created_at between from_iso8601_timestamp(first_reported_at) and event_resolved_at
+  where 
+    name = 'ban' 
+),
+rider_suspensions as (
+  select
+    trip_uuid,
+    type,
+    min(action_timestamp) as action_timestamp
+  from
+    flack f
+    join customer_obsession.fact_bliss_action fba on f.bliss_ticket = fba.ticket_uuid
+  where
+    type in ('banClientV1')
+    and date(fba.datestr) >= date '{{begin_date_inclusive}}'
+    group by 1,2
+),
+
+rider_reactivation as (
+  select
+    trip_uuid,
+    type,
+    min(action_timestamp) as unban_action_timestamp
+  from
+    flack f
+    join customer_obsession.fact_bliss_action fba on f.bliss_ticket = fba.ticket_uuid
+  where
+    type in ('unbanClientV1')
+    and date(fba.datestr) >= date '{{begin_date_inclusive}}'
+    group by 1,2
+)
+
+select
+  *
+from
+  (
+    select
+      distinct 
+      f.dominant_ticket_type,
+      f.dominant_ticket_id,
+      f.dominant_ticket_link as ticket_link,
+    --   f.bliss_ticket,
+      fdf.flow_type,
+      t.flow,
+      t.global_product_name,
+      dominant_ticket_reported_against_provided_by_agent,
+      j.action_on_reported_account,
+      j.reporter,
+      c.trip_uuid as compliance_match,
+      t.uuid as trip_uuid,
+      f.category,
+      f.subcategory,
+      cpuc_category,
+      cpuc_subcategory, 
+      cpuc_classification,
+      any_category, 
+      any_subcategory, 
+      any_cpuc_subcategory,
+      dominant_ticket_reported_against_inferred_possible,
+      dominant_ticket_reported_against_inferred_probable,
+      reactive_time_local,
+      dwr.row_num,
+      dwr.status,
+      dwr.action_timestamp,
+      rider_ticket,
+      driver_ticket,
+      is_dominant_ticket_invalid,
+      investigation_bliss,
+      rbt.created_at,
+      rbt.deleted_at,
+      event_resolved_at,
+      first_reported_at,
+    case
+        when cpuc_classification is not null
+        then 1
+        -- upper(coalesce(cpuc_classification,any_cpuc_classification))
+        else 0
+        -- upper(concat(coalesce(cpuc_category,any_category), ' - ', coalesce(cpuc_subcategory,any_cpuc_subcategory)))
+      end as AssaultHarassType_test,
+       coalesce(cpuc_classification,any_cpuc_classification),
+       coalesce(cpuc_category,any_category), ' - ', coalesce(cpuc_subcategory,any_cpuc_subcategory),
+      --all data above for information and QA purposes only
+      --all data below will actually be sent to CPUC
+      -- hash_tripid as "Waybill Number of Trip",
+      'PSG0038150' as TNCID,
+      '20220919' as SubmissionDate,
+      'NOT PROVIDED' as RideId,
+      upper(t.uuid) as Waybill1,
+      --waybill1 will be hashed trip_uuid
+      '' as Waybill2,
+      '' as Waybill3,
+      '' as Waybill4,
+      '' as Waybill5,
+      '' as Waybill6,
+      '' as Waybill7,
+      upper(
+        concat(
+          substr(t.uuid, 1, 8),
+          '-',
+          substr(t.driver_uuid, 1, 8),
+          substr(
+            cast(
+              DATEDIFF(
+                'day',
+                date(request_date_id_local),
+                date '1990-01-01'
+              ) as varchar
+            ),
+            2,
+            4
+          )
+        )
+      ) as ComplaintID,
+      -- d.lastname||', '||d.firstname as "Name of Driver (Last Name, First Name)", --removing as we will have a mapping csv for driver uuid to name
+      case
+        when t.driver_uuid IS NOT null
+        THEN upper(t.driver_uuid)
+        else ''
+      end as DriverID,
+      case
+        when v.vin IS NOT null
+        THEN upper(v.vin)
+        else ''
+      end as VIN,
+      case
+        when v.make IS NOT null
+        THEN upper(v.make)
+        else ''
+      end as VehicleMake,
+      case
+        when v.model IS NOT null
+        THEN upper(v.model)
+        else ''
+      end as VehicleModel,
+      case
+        when v.year IS NOT null
+        THEN cast(v.year as varchar)
+        else ''
+      end as VehicleYear,
+      date_format(
+        coalesce(
+          t.dropoff_timestamp_local,
+          end_trip_local,
+          t.request_timestamp_local
+        ),
+        '%Y%m%d %H:%i:%s'
+      ) as AssaultHarassDate,
+      substr(
+        cast(
+          coalesce(t.dropoff_lat, end_lat, t.request_lat) as varchar
+        ),
+        1,
+        9
+      ) as AssaultHarassLat,
+      -- requested assault location but we can not determine exact location, defaulting to end trip
+      substr(
+        cast(
+          coalesce(t.dropoff_lng, end_lng, t.request_lng) as varchar
+        ),
+        1,
+        11
+      ) as AssaultHarassLong,
+      -- requested assault location but we can not determine exact location, defaulting to end trip
+      coalesce(
+        postalcode,
+        zcta_where_ride_ended,
+        zcta_where_ride_began
+      ) as AssaultHarassZip,
+      coalesce(
+        concat(
+          lpad(cast(statefp10 as varchar), 2, '0'),
+          lpad(cast(countyfp10 as varchar), 3, '0'),
+          lpad(cast(tractce10 as varchar), 6, '0')
+        ),
+        ''
+      ) as AssaultHarassTract,
+      case
+        when census_block_code IS NOT null
+        THEN concat(
+          lpad(cast(statefp10 as varchar), 2, '0'),
+          lpad(cast(countyfp10 as varchar), 3, '0'),
+          lpad(cast(tractce10 as varchar), 6, '0'),
+          lpad(cast(blockce as varchar), 4, '0')
+        )
+        else ''
+      end as AssaultHarassCB,
+      date_format(
+        cast(
+          concat(
+            substr(first_reported_at, 1, 10),
+            ' ',
+            substr(first_reported_at, 12, 8),
+            ' UTC'
+          ) as timestamp with time zone
+        ) AT TIME ZONE 'America/Los_Angeles',
+        '%Y%m%d %H:%i:%s'
+      ) as ComplaintFiledDate,
+      case
+        when coalesce(cpuc_subcategory,any_subcategory) in (
+          'Insufficient Information',
+          'Parent Category Usage Tracking',
+          'Public Urination'
+        ) and rider_ticket = 1 and driver_ticket = 1
+        then 'Y'
+        when coalesce(cpuc_subcategory,any_subcategory) in (
+          'Insufficient Information',
+          'Parent Category Usage Tracking',
+          'Public Urination'
+        ) then coalesce(investigation_bliss,'N')
+        else 'Y'
+      end as Investigation,
+      case
+        when fds.action_time_local is not null
+        THEN date_format(fds.action_time_local, '%Y%m%d %H:%i:%s')
+        else ''
+      end as DriverSuspendDate,
+      case
+        when rs.type = 'banClientV1'
+        then date_format(rs.action_timestamp at time zone 'America/Los_Angeles', '%Y%m%d %H:%i:%s')
+        else coalesce(date_format(rbt.created_at at time zone 'America/Los_Angeles', '%Y%m%d %H:%i:%s'),'')
+      end as PassengerSuspendDate,
+      coalesce(
+        date_format(
+          event_resolved_at AT TIME ZONE 'America/Los_Angeles',
+          '%Y%m%d %H:%i:%s'
+        ),
+        date_format(
+          case
+            when length(resolved_at) > 6
+            then from_iso8601_timestamp(j.resolved_at) AT TIME ZONE 'America/Los_Angeles'
+            else null
+          end,
+          '%Y%m%d %H:%i:%s'
+        ),
+        date_format(
+          close_timestamp AT TIME ZONE 'America/Los_Angeles',
+          '%Y%m%d %H:%i:%s'
+        )
+      ) as ComplaintResolveDate,
+      case
+        when cpuc_classification is not null
+        then upper(coalesce(cpuc_classification,any_cpuc_classification))
+        else upper(concat(coalesce(cpuc_category,any_category), ' - ', coalesce(cpuc_subcategory,any_cpuc_subcategory)))
+      end as AssaultHarassType,
+      case
+        when 
+            cpuc_classification is not null  
+            and cpuc_subcategory is not null
+        then concat(
+          'ON ',
+          date_format(
+            cast(
+              concat(
+                substr(first_reported_at, 1, 10),
+                ' ',
+                substr(first_reported_at, 12, 8),
+                ' UTC'
+              ) as timestamp with time zone
+            ) AT TIME ZONE 'America/Los_Angeles',
+            '%Y-%m-%d'
+          ),
+          ' AN INDIVIDUAL REPORTED A ',
+          upper(cpuc_category),
+          ' REGARDING ',
+          upper(cpuc_subcategory),
+          '.'
+        )
+        when 
+            cpuc_classification is null  
+            and any_cpuc_subcategory is not null
+        then concat(
+          'ON ',
+          date_format(
+            cast(
+              concat(
+                substr(first_reported_at, 1, 10),
+                ' ',
+                substr(first_reported_at, 12, 8),
+                ' UTC'
+              ) as timestamp with time zone
+            ) AT TIME ZONE 'America/Los_Angeles',
+            '%Y-%m-%d'
+          ),
+          ' AN INDIVIDUAL REPORTED A ',
+          upper(any_category),
+          ' REGARDING ',
+          upper(any_cpuc_subcategory),
+          '.'
+        )
+        when 
+            cpuc_classification is not null  
+            and cpuc_subcategory is null 
+        then concat(
+          'ON ',
+          date_format(
+            cast(
+              concat(
+                substr(first_reported_at, 1, 10),
+                ' ',
+                substr(first_reported_at, 12, 8),
+                ' UTC'
+              ) as timestamp with time zone
+            ) AT TIME ZONE 'America/Los_Angeles',
+            '%Y-%m-%d'
+          ),
+          ' AN INDIVIDUAL REPORTED A ',
+          upper(cpuc_category),
+          '.')
+          else
+          concat(
+          'ON ',
+          date_format(
+            cast(
+              concat(
+                substr(first_reported_at, 1, 10),
+                ' ',
+                substr(first_reported_at, 12, 8),
+                ' UTC'
+              ) as timestamp with time zone
+            ) AT TIME ZONE 'America/Los_Angeles',
+            '%Y-%m-%d'
+          ),
+          ' AN INDIVIDUAL REPORTED A ',
+          upper(any_category),
+          '.')
+          end  
+          as AssaultHarassDescr,
+      '' as AssaultHarassDef,
+      case
+        when t.global_product_name = 'RIDESHARE'
+        then 'Y'
+        else 'N'
+      end as PoolTrip,
+      case
+        when d.user_uuid = f.trip_driver_uuid 
+        then 'DEACTIVATED'
+        when dwr.status = 'Rejected'
+        then 'DEACTIVATED'
+        when dwr.status = 'Wait Listed'
+        and reactive_time_local is not null
+        then 'REACTIVATED' --do we need to account for if it's still the last status change?
+        --per Niki in meeting Leave it blank if in progress or waitlisted
+        when dwr.status is null
+        then 'CONTINUE'
+        when dwr.status = 'Wait Listed'
+        and reactive_time_local is null
+        then ''
+        else 'investigate'
+      end as DriverConsequence,
+      case
+        when (
+          incident_reported_against = 'Rider'
+          and action_on_reported_account = 'Driver Deactivated or Rider Banned'
+          ) then 'DEACTIVATED'
+          when rr.unban_action_timestamp is not null
+          then  'REACTIVATED'
+          when rs.type is null then 'CONTINUE'
+          else 'investigate'
+        end
+       as PassengerConsequence,
+ 
+      case        
+        when 
+            coalesce(cpuc_subcategory,any_subcategory) in (
+              'Insufficient Information',
+              'Parent Category Usage Tracking',
+              'Public Urination'
+            ) 
+            and rider_ticket = 1 and driver_ticket = 1
+            and (
+            dominant_ticket_reported_against_provided_by_agent = 'DRIVER'
+            or (dominant_ticket_reported_against_provided_by_agent = 'UNKNOWN' and dominant_ticket_reported_against_inferred_probable in ('DRIVER') )
+            )
+        then 'OUTBOUND MESSAGE SENT TO DRIVER.'
+        when 
+            coalesce(cpuc_subcategory,any_subcategory) in (
+              'Insufficient Information',
+              'Parent Category Usage Tracking',
+              'Public Urination'
+            ) and rider_ticket = 1 and driver_ticket = 1
+            and (
+            dominant_ticket_reported_against_provided_by_agent = 'RIDER'
+            or (dominant_ticket_reported_against_provided_by_agent = 'UNKNOWN' and dominant_ticket_reported_against_inferred_probable in ('RIDER') )
+            )
+        then 'OUTBOUND MESSAGE SENT TO RIDER.'  
+        when 
+            coalesce(cpuc_subcategory,any_subcategory) in (
+              'Insufficient Information',
+              'Parent Category Usage Tracking',
+              'Public Urination'
+            ) and investigation_bliss is not null 
+        then 'OUTBOUND MESSAGE SENT TO REPORTER REQUESTING ADDITIONAL DETAILS.'
+        when 
+            coalesce(cpuc_subcategory,any_subcategory) in (
+              'Insufficient Information',
+              'Parent Category Usage Tracking',
+              'Public Urination'
+            ) 
+        then 'investigate'
+        when dominant_ticket_reported_against_provided_by_agent = 'DRIVER' then 'OUTBOUND MESSAGE SENT TO DRIVER.'
+        when dominant_ticket_reported_against_provided_by_agent = 'UNKNOWN' and dominant_ticket_reported_against_inferred_probable in ('DRIVER') then 'OUTBOUND MESSAGE SENT TO DRIVER.'
+        when dominant_ticket_reported_against_provided_by_agent = 'RIDER' then 'OUTBOUND MESSAGE SENT TO RIDER.'
+        when dominant_ticket_reported_against_provided_by_agent = 'UNKNOWN' and dominant_ticket_reported_against_inferred_probable in ('RIDER') then 'OUTBOUND MESSAGE SENT TO RIDER.'
+      end as ComplaintResolveDescr,
+      case
+        when c.banned = TRUE
+        then 'N'
+        else 'Y'
+      end as PassengerCurrentAuth,
+      case
+        when d.status = 'Active'
+        then 'Y'
+        else 'N'
+      end as DriverCurrentAuth,
+      row_number() over (
+        PARTITION by t.uuid
+        order by
+          postalcode asc, close_timestamp desc
+      ) as dedupe
+    from
+      dwh.fact_trip t
+      join flack f on t.uuid = f.trip_uuid
+      left join dwh.dim_client c on f.trip_client_uuid = c.user_uuid
+      left join driver_waitlist_rejections dwr on dwr.trip_uuid = f.trip_uuid and dwr.row_num = 1
+      left join deactivations d on f.dominant_ticket_id = d.jira_key
+      and t.city_id in (
+        41,
+        1,
+        229,
+        212,
+        220,
+        191,
+        181,
+        241,
+        12,
+        30,
+        29,
+        228,
+        21
+      ) -- California only
+      join dwh.dim_driver d on d.driver_uuid = f.trip_driver_uuid
+      join dwh.dim_vehicle v on v.vehicle_uuid = t.vehicle_uuid
+      join dwh.fact_driver_flow fdf on d.driver_uuid = fdf.driver_uuid
+      left join secure_safety.blackbird_jira_tickets j on j.ticket_id = f.dominant_ticket_id
+      left join secure_compliance.cds_ca_trips c on t.uuid = c.trip_uuid --checking if trips exist in Compliance base table for trips reports
+      left join secure_safety.tg_cpuc_zip z on st_intersects(z.simplified_shape_wkt, t.dropoff_point) --zipcode CA geo based on map_creation.geofences_mbi_postal
+      left join secure_compliance.cds_geo_us_census_block on st_intersects(shape_wkt, t.dropoff_point) -- we are getting census block info from this table
+      left join end_trip_details etd on f.trip_uuid = etd.job_uuid --join in trip details for non completed trips
+      left join rider_suspensions rs on rs.trip_uuid = t.uuid
+      left join rider_reactivation rr on rs.trip_uuid = t.uuid
+      left join first_driver_suspension fds on fds.trip_uuid = t.uuid
+      left join first_driver_reactivation fdr on fds.trip_driver_uuid = fdr.trip_driver_uuid
+      left join flack_responses fs on fs.trip_uuid = t.uuid  
+      left join bliss_ticket_investigation bi on bi.trip_uuid = t.uuid
+      left join rider_ban_tag rbt on rbt.trip_uuid = t.uuid
+    where
+      1 = 1
+      and date(t.datestr) between date('{{begin_date_inclusive}}')
+      and date('{{end_date_exclusive}}')
+      and date(t.request_timestamp_local) >= date('{{begin_date_inclusive}}')
+      and date(t.request_timestamp_local) < date('{{end_date_exclusive}}')
+      and t.city_id in (
+        41,
+        1,
+        229,
+        212,
+        220,
+        191,
+        181,
+        241,
+        12,
+        30,
+        29,
+        228,
+        21)
+--we want to filter out reports based on third party
+      and (
+        start_timestamp <= t.request_timestamp_utc
+        and (
+          end_timestamp > t.request_timestamp_utc
+          or end_timestamp is null
+        )
+      ) --to filter out driver flow at time of trip request
+      and fdf.flow_type = 'P2P' --P2P only
+      and (
+        upper(t.global_product_name) in (
+          'UBERX',
+          'UBERXL',
+          'RIDESHARE',
+          'MID-TIER',
+          'HOURLY',
+          'SELECT',
+          'GREEN'
+        )
+      ) --rides only
+)
+where
+  1 = 1
+  and dedupe = 1
+order by
+ AssaultHarassDate
